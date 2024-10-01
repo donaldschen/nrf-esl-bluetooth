@@ -41,6 +41,42 @@
 #include "esl_nfc_impl.h"
 #endif /* CONFIG_ESL_NFC_SUPPORT */
 
+/* twis ... */
+#include <nrfx_twis.h>
+
+#define TWI_BUF_SZ    16
+/** @brief Symbol specifying pin number of slave SCL. */
+#define SLAVE_SCL_PIN 25
+
+/** @brief Symbol specifying pin number of slave SDA. */
+#define SLAVE_SDA_PIN 24
+#define TWIS_INST_IDX 1
+static nrfx_twis_t twis_inst = NRFX_TWIS_INSTANCE(TWIS_INST_IDX);
+
+/** @brief TWIS recieve buffer for a message from TWIM. */
+static uint8_t twis_rx_buffer[TWI_BUF_SZ];
+static uint8_t twis_addr = 0xff;
+
+/* twis ... */
+#define WITH_TWIM // define to enable onboard twim, will need to jumper sda/scl
+#ifdef WITH_TWIM
+/* twim ... */
+#include <nrfx_twim.h>
+
+/** @brief Symbol specifying pin number of master SCL. */
+#define MASTER_SCL_PIN 26
+
+/** @brief Symbol specifying pin number of master SDA. */
+#define MASTER_SDA_PIN 23
+
+#define TWIM_INST_IDX 0
+static nrfx_twim_t twim_inst = NRFX_TWIM_INSTANCE(TWIM_INST_IDX);
+
+static uint8_t twim_tx_buffer[TWI_BUF_SZ];
+static uint8_t twim_rx_buffer[TWI_BUF_SZ];
+
+/* twim ...*/
+#endif
 
 LOG_MODULE_REGISTER(peripheral_esl, CONFIG_PERIPHERAL_ESL_LOG_LEVEL);
 
@@ -229,6 +265,26 @@ static void configure_dk_button(void)
 	}
 }
 
+#ifdef WITH_TWIM
+static void twim_txrx()
+{
+	nrfx_err_t status;
+	(void)status;
+
+	uint8_t tx_fill = (k_uptime_get_32() & 0xff);
+	memset(twim_rx_buffer, 0, sizeof(twim_rx_buffer));
+	memset(twim_tx_buffer, tx_fill, sizeof(twim_tx_buffer));
+	nrfx_twim_xfer_desc_t twim_xfer_desc =
+		NRFX_TWIM_XFER_DESC_TXRX(twis_addr, twim_tx_buffer, sizeof(twim_tx_buffer),
+					 twim_rx_buffer, sizeof(twim_rx_buffer));
+
+	LOG_INF("TWIM start: addr %02x, send %02x...", twis_addr, tx_fill);
+
+	status = nrfx_twim_xfer(&twim_inst, &twim_xfer_desc, 0);
+	NRFX_ASSERT(status == NRFX_SUCCESS);
+}
+#endif
+
 static int start_execute(void)
 {
 	int err;
@@ -331,12 +387,136 @@ static int start_execute(void)
 #endif /* CONFIG_MCUBOOT_IMAGE_VERSION */
 
 	for (;;) {
+#ifdef WITH_TWIM
+		// 5s txrx
+		twim_txrx();
+		k_sleep(SYS_TIMEOUT_MS(5000));
+#else
 		k_sleep(K_FOREVER);
+#endif
 	}
 }
 
+/**
+ * @brief Function for handling TWIS driver events.
+ *
+ * @param[in] p_event Event information structure.
+ */
+static void twis_handler(nrfx_twis_evt_t const *p_event)
+{
+	nrfx_err_t status;
+	(void)status;
+
+	switch (p_event->type) {
+	case NRFX_TWIS_EVT_WRITE_DONE:
+		LOG_INF("--> Slave event: write done.");
+		break;
+
+	case NRFX_TWIS_EVT_READ_DONE:
+		LOG_INF("--> Slave event: read done.");
+		break;
+
+	case NRFX_TWIS_EVT_WRITE_REQ:
+		status = nrfx_twis_rx_prepare(&twis_inst, twis_rx_buffer, sizeof(twis_rx_buffer));
+		NRFX_ASSERT(status == NRFX_SUCCESS);
+		LOG_INF("--> Slave event: write request");
+		break;
+
+	case NRFX_TWIS_EVT_READ_REQ:
+		status = nrfx_twis_tx_prepare(&twis_inst, twis_rx_buffer, sizeof(twis_rx_buffer));
+		NRFX_ASSERT(status == NRFX_SUCCESS);
+		LOG_INF("--> Slave event: read request");
+		break;
+
+	default:
+		LOG_INF("--> SLAVE event: %d.", p_event->type);
+	}
+}
+
+static void twis_init()
+{
+	nrfx_err_t status;
+	(void)status; // not sure whats up with the assert macro
+
+	// read the slave addr from the gpios
+	uint8_t slave_addr = 0;
+	uint8_t addrPins[] = {3, 28, 4, 2, 30, 31, 29, 27};
+	for (int i = 0; i < 8; i++) {
+		uint8_t pin = addrPins[i];
+		nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_PULLDOWN);
+		if (nrf_gpio_pin_read(pin) != 0) {
+			slave_addr |= (1 << i);
+		}
+	}
+
+	twis_addr = slave_addr;
+
+	LOG_INF("TWIS init: slaveAddr 0x%02x, sda %d, scl %d", slave_addr, SLAVE_SDA_PIN,
+		SLAVE_SCL_PIN);
+
+	nrfx_twis_config_t twis_config =
+		NRFX_TWIS_DEFAULT_CONFIG(SLAVE_SCL_PIN, SLAVE_SDA_PIN, slave_addr);
+	// twis_config.sda_pull = NRF_GPIO_PIN_PULLUP;
+	status = nrfx_twis_init(&twis_inst, &twis_config, twis_handler);
+	NRFX_ASSERT(status == NRFX_SUCCESS);
+
+	nrfx_twis_enable(&twis_inst);
+}
+
+#ifdef WITH_TWIM
+/**
+ * @brief Function for handling TWIM driver events.
+ *
+ * @param[in] p_event   Event information structure.
+ * @param[in] p_context General purpose parameter set during initialization of the TWIM.
+ *                      This parameter can be used to pass additional information to the
+ *                      handler function. In this example @p p_context is used to pass address
+ *                      of TWI transfer descriptor structure.
+ */
+static void twim_handler(nrfx_twim_evt_t const *p_event, void *p_context)
+{
+	// nrfx_twim_xfer_desc_t *twim_desc = p_context;
+	if (p_event->type == NRFX_TWIM_EVT_DONE) {
+		LOG_INF("--> Master event: done - transfer completed");
+		LOG_INF("Content of master RX buffer: %02x...", twim_rx_buffer[0]);
+		// }
+	} else {
+		LOG_INF("--> MASTER handler, event: %d.", p_event->type);
+	}
+}
+
+void twim_init(void)
+{
+	nrfx_err_t status;
+	(void)status;
+
+	LOG_INF("TWIM init: sda %d, scl %d", MASTER_SDA_PIN, MASTER_SCL_PIN);
+	nrfx_twim_xfer_desc_t twim_xfer_desc =
+		NRFX_TWIM_XFER_DESC_TX(twis_addr, twim_tx_buffer, sizeof(twim_tx_buffer));
+	nrfx_twim_config_t twim_config = NRFX_TWIM_DEFAULT_CONFIG(MASTER_SCL_PIN, MASTER_SDA_PIN);
+	status = nrfx_twim_init(&twim_inst, &twim_config, twim_handler, &twim_xfer_desc);
+	NRFX_ASSERT(status == NRFX_SUCCESS);
+
+	nrfx_twim_enable(&twim_inst);
+}
+#endif
+
 int main(void)
 {
+#ifdef WITH_TWIM
+	IRQ_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_TWIM_INST_GET(TWIM_INST_IDX)), IRQ_PRIO_LOWEST,
+		    NRFX_TWIM_INST_HANDLER_GET(TWIM_INST_IDX), 0, 0);
+#endif
+
+	IRQ_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_TWIS_INST_GET(TWIS_INST_IDX)), IRQ_PRIO_LOWEST,
+		    NRFX_TWIS_INST_HANDLER_GET(TWIS_INST_IDX), 0, 0);
+
+	twis_init(); // twis first to assign the static addr
+
+#ifdef WITH_TWIM
+	twim_init();
+#endif
+
 #if defined(CONFIG_ESL_NFC_SUPPORT)
 	int err;
 
@@ -363,6 +543,11 @@ int main(void)
 		system_off();
 	}
 #else
+
+#ifdef WITH_TWIM
+	twim_txrx();
+#endif
+
 	return start_execute();
 #endif /* CONFIG_ESL_SHIPPING_MODE */
 }

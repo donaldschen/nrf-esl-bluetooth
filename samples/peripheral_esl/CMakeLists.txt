@@ -97,4 +97,12 @@ endif()
 
 # NORDIC SDK APP END
 
+#just throw the defines in here to get it to run lol
+add_definitions( -DNRFX_TWIM_ENABLED=1 -DNRFX_TWIM0_ENABLED=1 )
+add_definitions( -DNRFX_TWIS_ENABLED=1 -DNRFX_TWIS1_ENABLED=1 )
+target_sources(app PRIVATE ../../../../../../modules/hal/nordic/nrfx/drivers/src/nrfx_twim.c)
+target_sources(app PRIVATE ../../../../../../modules/hal/nordic/nrfx/drivers/src/nrfx_twis.c)
+target_include_directories(app PRIVATE ../../../../../../modules/hal/nordic/nrfx/drivers/include/)
+
+
 target_include_directories(app PRIVATE hw)
